@@ -5,7 +5,10 @@ Register-level, no HAL, no vendor SDK.
 
 ## Boot Flow
 ![Bootloader Flow](stm32_bootloader_complete_flow.svg)
-
+> Note: SRAM magic trigger (0xDEAD1234) is shown in the flowchart 
+> but not yet implemented. Currently, update mode is entered via 
+> K0 button press only.
+> 
 ## Status
 
 - [x] Phase 1: Application at 0x08010000, VTOR relocated
