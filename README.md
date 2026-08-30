@@ -3,6 +3,9 @@
 Bare-metal two-stage boot for the STM32F407VET6 (DevEBox "F4VE" board).  
 Register-level, no HAL, no vendor SDK.
 
+## Boot Flow
+![Bootloader Flow](stm32_bootloader_complete_flow.svg)
+
 ## Status
 
 - [x] Phase 1: Application at 0x08010000, VTOR relocated
