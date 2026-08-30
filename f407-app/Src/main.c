@@ -16,11 +16,12 @@ int main(void)
 
     while (1)
     {
-        /* LEDs are active-low; toggling makes polarity irrelevant. */
-        GPIOA->ODR ^= (1u << 6) | (1u << 7);
+        GPIOA->ODR |=  (1u << 6);    /* PA6 ON  */
+        GPIOA->ODR &= ~(1u << 7);   /* PA7 OFF */
+        for (volatile uint32_t i = 0; i < 2000000; i++) { }
 
-        /* Busy-wait ~200-300ms at 16 MHz -O0. `volatile` stops the
-         * compiler from deleting the empty loop.                    */
+        GPIOA->ODR &= ~(1u << 6);   /* PA6 OFF */
+        GPIOA->ODR |=  (1u << 7);   /* PA7 ON  */
         for (volatile uint32_t i = 0; i < 2000000; i++) { }
     }
 }

@@ -49,7 +49,7 @@
 /* Includes */
 #include <errno.h>
 #include <stdio.h>
-
+#include <sys/types.h>
 /* Variables */
 extern int errno;
 register char * stack_ptr asm("sp");
