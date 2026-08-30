@@ -3,12 +3,6 @@
 Bare-metal two-stage boot for the STM32F407VET6 (DevEBox "F4VE" board).  
 Register-level, no HAL, no vendor SDK.
 
-## Boot Flow
-![Bootloader Flow](stm32_bootloader_complete_flow.svg)
-> Note: SRAM magic trigger (0xDEAD1234) is shown in the flowchart 
-> but not yet implemented. Currently, update mode is entered via 
-> K0 button press only.
-> 
 ## Status
 
 - [x] Phase 1: Application at 0x08010000, VTOR relocated
@@ -17,8 +11,10 @@ Register-level, no HAL, no vendor SDK.
 - [x] Phase 3b: UART driver — USART1 PA9/PA10, 115200-8N1, bare-metal register config
 - [x] Phase 4: Flash self-programming (unlock, sector erase, word program, verify)
 - [x] Phase 5: Framed protocol + Python host flasher (PING, ERASE, WRITE, VERIFY, JUMP)
-- [ ] Phase 6: File restructure (uart.c, flash.c, protocol.c)
-- [ ] Phase 7 (stretch): CAN transport, AES-128 encryption, ECDSA image signature
+- [x] Phase 6: Software-triggered reprogram — SRAM magic + NVIC_SystemReset, no button needed if an app is running
+- [x] Phase 7: Non-blocking repeating "BOOT> Ready" announce — flasher script can be started before or after entering update mode
+- [ ] Phase 8: File restructure (uart.c, flash.c, protocol.c)
+- [ ] Phase 9 (stretch): CAN transport, AES-128 encryption, ECDSA image signature
 
 ## Protocol
 
@@ -32,7 +28,7 @@ Custom binary framing over UART:
 |---------|------|---------|----------|
 | PING    | 0x01 | none | ACK (0x79) |
 | ERASE   | 0x02 | none (sectors 4–7 hardcoded) | ACK |
-| WRITE   | 0x03 | 4-byte addr + up to 1024 data | ACK |
+| WRITE   | 0x03 | 4-byte addr + up to 1020 data | ACK |
 | VERIFY  | 0x04 | 4-byte addr + 4-byte length | ACK + CRC32 |
 | JUMP    | 0x05 | none | ACK → app launches |
 
@@ -40,6 +36,9 @@ Custom binary framing over UART:
 - Address fencing: WRITE/VERIFY reject addresses outside 0x08010000–0x0807FFFF
 - Bootloader sectors (0–3) are never erased or written — hardcoded protection
 - NACK (0x1F) + error code returned on failure
+- Max payload is 1024 bytes total (bootloader's `rx_buff` size). WRITE reserves
+  4 of those bytes for the address, so the host chunks firmware data at 1020
+  bytes per chunk to stay under the limit.
 
 ### Error Codes
 
@@ -67,18 +66,53 @@ Sector 6:  0x08040000  128KB │ Erased + programmed via UART
 Sector 7:  0x08060000  128KB ┘
 ```
 
+## SRAM Layout
+
+The top 16 bytes of SRAM are reserved (both linker scripts set
+`RAM LENGTH = 128K-16` and `_estack = 0x20020000-16`) so the stack can never
+grow into the software-reset magic value:
+
+```
+0x20020000  ┬─ physical top of SRAM
+0x2001FFF0  │  MAGIC_ADDR — reserved, outside stack's reach
+            ├─ _estack (stack starts here, grows downward)
+            ↓
+0x20000000  ┴─ bottom of SRAM (.data / .bss / heap)
+```
+
 ## Boot Flow
 
 ```
 Power On → Intro Blinks (6 toggles on PA6)
     │
-    ├── K0 pressed within timeout?
-    │   ├── Yes → UART init → "BOOT> Ready" → Protocol Loop
-    │   │         (PING / ERASE / WRITE / VERIFY / JUMP)
-    │   └── No  → Valid app at 0x08010000?
-    │               ├── Yes → Clean peripherals → VTOR + MSP + Jump to app
-    │               └── No  → Fast blink (no valid app found)
+    ├── SRAM magic (0xB007B007) present at 0x2001FFF0?
+    │   ├── Yes → clear it → skip button check → enter update mode
+    │   └── No  → check K0 within timeout
+    │             ├── Pressed → enter update mode
+    │             └── Not pressed → Valid app at 0x08010000?
+    │                   ├── Yes → Clean peripherals → VTOR + MSP + Jump to app
+    │                   └── No  → Fast blink (no valid app found)
+    │
+    └── Update mode → UART init → repeating "BOOT> Ready" every ~1s
+                       until SYNC received → Protocol Loop
+                       (PING / ERASE / WRITE / VERIFY / JUMP)
 ```
+
+### Software-Triggered Reprogramming
+
+A running app can request reprogramming without any button press:
+
+```
+App:        writes 0xB007B007 to 0x2001FFF0 → NVIC_SystemReset()
+Bootloader: reads 0x2001FFF0 on boot → sees magic → clears it →
+            skips button-timeout entirely → goes straight to UART protocol
+```
+
+The host tool's `enter_bootloader()` sends a **complete PING frame** (not a
+bare sync byte) to trigger this — the same bytes work whether an app is
+running (only checks the leading `0x7F`, ignores the rest and resets) or the
+bootloader is already active (parses the full frame as a valid PING and
+ACKs normally, avoiding any desync between the two possible listeners).
 
 ### App Validation
 
@@ -101,8 +135,13 @@ Erased flash (0xFFFFFFFF) or test patterns fail this check — the bootloader re
 
 ```
 $ py flasher.py COM5 f407-app.bin
-Firmware: f407-app.bin (936 bytes, 0.9KB, 1 chunks)
+Firmware: f407-app.bin (1140 bytes, 1.1KB, 2 chunks)
+Requesting bootloader mode (in case app is running)...
+  Sent PING frame, waiting for reset/response to settle...
+  Buffer cleared, proceeding to greeting wait
 Waiting for bootloader...
+  [raw] b'B'
+  [raw] b'OOT> Ready\r\n'
   [RX] BOOT> Ready
 Connected!
 PING...
@@ -113,19 +152,19 @@ ERASE sectors 4-7...
   [TX] 7f 02 00 00 fc c5 0d 7c
   [RX] 79
   ACK (4.0s)
-WRITE 1/1 @ 0x08010000 (936 bytes)...
-  [TX] 7f 03 03 ac 08 01 00 00 ... (936 bytes of firmware)
+WRITE 1/2 @ 0x08010000 (1020 bytes)...
+  [RX] 79
+  ACK
+WRITE 2/2 @ 0x080103FC (120 bytes)...
   [RX] 79
   ACK
 VERIFY...
-  [TX] 7f 04 00 08 08 01 00 00 00 00 03 a8 e6 34 08 6e
-  [RX] 79 69 27 f1 49
+  [RX] 79 ...
   MATCH (CRC: 0x6927F149)
 JUMP...
-  [TX] 7f 05 00 00 f9 8a 1b f9
   [RX] 79
   App launched!
-Done in 4.1s
+Done in 4.6s
 ```
 
 ## Hardware
@@ -135,7 +174,8 @@ Done in 4.1s
 - **UART adapter:** CH340 USB-to-TTL module (3.3V logic)
 - **Power:** USB-C (board powered independently from adapter)
 - **LEDs:** D2/PA6 (bootloader indicator), D2+D3/PA6+PA7 (app running)
-- **Boot mode entry:** K0/PA0 held during intro blinks → update mode
+- **Boot mode entry:** K0/PA0 held during intro blinks, OR automatically
+  triggered by the flasher tool if a compatible app is already running
 
 ### Wiring
 
@@ -162,6 +202,10 @@ Yellow jumper on adapter: set to 3.3V side
 |---------|-------------|------|-------------|
 | f407-boot | 0x08000000 | 64KB reserved | Bootloader |
 | f407-app | 0x08010000 | 448KB available | Application |
+
+Both projects' `.ld` scripts reserve the top 16 bytes of SRAM
+(`LENGTH = 128K-16`, `_estack = 0x20020000-16`) for the software-reset
+magic value — keep this consistent if either linker script is regenerated.
 
 ### Generate .bin from .elf
 
@@ -190,13 +234,20 @@ pip install pyserial
 py flasher.py COM5 f407-app.bin
 ```
 
+Works whether an app is currently running (auto-triggers reprogramming) or
+the board is already sitting in update mode via K0 — the script can be
+started before or after entering update mode, since the bootloader
+re-announces itself periodically until it sees a valid frame.
+
 **Features:**
-- Automatic bootloader greeting detection
+- Automatic bootloader wake/greeting detection, with a full TX/RX byte log
 - CRC32-verified frame transmission
-- Chunked firmware transfer (1024 bytes per chunk)
+- Chunked firmware transfer (1020 bytes of data per WRITE, 1024 bytes total per frame)
 - Full TX/RX frame logging to `flash_log.txt`
 - Timing and transfer speed statistics
 - Address validation (rejects writes outside app region)
+
+
 
 
 ## License

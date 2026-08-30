@@ -1,11 +1,12 @@
 import serial, struct, time, sys
 from binascii import crc32
 
-CHUNK_SIZE = 1024
+CHUNK_SIZE = 1020
 BASE_ADDR  = 0x08010000
 LOG_FILE   = "flash_log.txt"
 
 log_handle = None
+
 
 def log(msg):
     print(msg)
@@ -18,6 +19,27 @@ def log_frame(direction, data):
     print(msg)
     if log_handle:
         log_handle.write(msg + "\n")
+
+def enter_bootloader(port):
+    """Wake a running app into the bootloader via software reset.
+    Sends a full valid PING frame — harmless whether caught by a
+    running app (triggers reset) or an already-running bootloader
+    (gets ACK'd normally, no desync)."""
+    log("Requesting bootloader mode (in case app is running)...")
+    port.reset_input_buffer()
+
+    # Send a complete PING frame, not a bare 0x7F —
+    # this way, even if the bootloader is already listening,
+    # it gets a fully valid frame instead of a dangling SYNC byte
+    header = bytes([0x01, 0x00, 0x00])  # CMD_PING, LEN=0
+    checksum = crc32(header) & 0xFFFFFFFF
+    ping_frame = bytes([0x7F]) + header + struct.pack(">I", checksum)
+    port.write(ping_frame)
+    port.flush()
+
+    log("  Sent PING frame, waiting for reset/response to settle...")
+    time.sleep(1.5)
+    port.reset_input_buffer()
 
 def send_cmd(port, cmd, payload=b""):
     header = bytes([cmd, len(payload) >> 8, len(payload) & 0xFF])
@@ -50,18 +72,34 @@ def flash_firmware(port_name, bin_path):
 
     port = serial.Serial(port_name, 115200, timeout=5)
     port.dtr = False
+    time.sleep(0.3)              # let any DTR-triggered reset settle
+    port.reset_input_buffer()    # clear garbage from that reset
 
-        # Wait for greeting
+    # Try to wake a running app first — no-op if bootloader already active
+    enter_bootloader(port)
+
+    # Wait for greeting — shows every byte, hard 5s timeout instead of hanging
     log("Waiting for bootloader...")
     buffer = b""
-    while True:
+    deadline = time.time() + 5
+    got_ready = False
+    while time.time() < deadline:
         data = port.read(port.in_waiting or 1)
-        buffer += data
+        if data:
+            buffer += data
+            log(f"  [raw] {data}")
         if b"Ready" in buffer:
             log(f"  [RX] {buffer.decode(errors='ignore').strip()}")
             log("Connected!")
+            got_ready = True
             break
         time.sleep(0.1)
+
+    if not got_ready:
+        log(f"  TIMEOUT — buffer so far: {buffer!r}")
+        port.close()
+        log_handle.close()
+        return
 
     time.sleep(0.2)
     port.reset_input_buffer()

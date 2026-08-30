@@ -17,8 +17,10 @@
 #define RUN_FLASH_TEST   0
 
 #define APP_SECTOR 4
-#define SRAM_START 0x20000000u   /* used to sanity-check app's initial SP */
-#define SRAM_END   0x20020000u
+#define SRAM_START 	 0x20000000u   /* used to sanity-check app's initial SP */
+#define SRAM_END   	 0x20020000u
+#define MAGIC_ADDR   ((volatile uint32_t *)0x2001FFF0)
+#define MAGIC_VALUE  0xB007B007u
 
 /* Busy-wait; volatile stops the compiler from deleting it */
 static void delay(volatile uint32_t n) { while (n--) __asm__("nop"); }
@@ -211,6 +213,17 @@ int main(void)
     GPIOA->MODER &= ~GPIO_MODER_MODER6;
     GPIOA->MODER |=  GPIO_MODER_MODER6_0;
 
+
+    /* Check for software-triggered reprogram request FIRST,
+     * before intro blinks or button check. SRAM survives a
+     * software reset, so an app can leave this flag before
+     * calling NVIC_SystemReset(). */
+    int enter_update_mode = 0;
+    if (*MAGIC_ADDR == MAGIC_VALUE) {
+        *MAGIC_ADDR = 0;          /* clear it so a normal reset later doesn't re-trigger */
+        enter_update_mode = 1;
+    }
+
     /* Intro blinks */
     for (int i = 0; i < 6; i++) {
         GPIOA->ODR ^= (1u << 6);
@@ -221,26 +234,21 @@ int main(void)
     run_flash_self_test();
 #else
     /* Read K0 button - PA0*/
-    int enter_update_mode=0;
-    for(int i=0;i<50;i++)
-    {
-        int button_pressed = (GPIOA->IDR & (1u << 0)) !=0;
-        if (button_pressed) {
-            enter_update_mode=1;
-            break;
+    if (!enter_update_mode) {
+            for (int i = 0; i < 50; i++) {
+                int button_pressed = (GPIOA->IDR & (1u << 0)) != 0;
+                if (button_pressed) {
+                    enter_update_mode = 1;
+                    break;
+                }
+                delay(200000);
+            }
         }
-        delay(200000);
-    }
 
      if (enter_update_mode) {
-    uart_init();
+    	 uart_init();
     /* Let host's serial port settle after opening */
        delay(100000);
-
-
-    /* Send a greeting so you know it's alive */
-    const char *msg = "BOOT> Ready\r\n";
-    while (*msg) uart_send(*msg++);
 
 
     /* CRITICAL: clear overrun before entering protocol loop */
@@ -250,9 +258,39 @@ int main(void)
 
     static uint8_t rx_buff[1024];
     while (1) {
-    	/* 1. Sync hunt */
-    	    while (uart_recv() != SYNC) { }
-    	    GPIOA->ODR ^= (1u << 6);    /* LED toggles = SYNC received */
+    	/* 1. Sync hunt — non-blocking, re-announces "BOOT> Ready" every ~1s
+    	 * if nobody responds. This lets the host start the flasher script
+    	 * AFTER entering update mode, not just before — the greeting keeps
+    	 * repeating until someone actually listens and sends SYNC. */
+    	uint32_t idle_ticks = 0;
+    	int got_sync = 0;
+
+    	while (!got_sync) {
+    	    /* Re-announce periodically while waiting */
+    	    if (idle_ticks == 0) {
+    	        const char *msg = "BOOT> Ready\r\n";
+    	        while (*msg) uart_send(*msg++);
+    	    }
+
+    	    /* Poll for a byte without blocking forever */
+    	    uint32_t sr = USART1->SR;
+    	    if (sr & USART_SR_ORE) {
+    	        (void)USART1->DR;   /* clear overrun, keep waiting */
+    	    } else if (sr & USART_SR_RXNE) {
+    	        uint8_t rb = (uint8_t)USART1->DR;
+    	        if (rb == SYNC) {
+    	            got_sync = 1;   /* exit the wait loop */
+    	        }
+    	        /* any other byte is silently discarded, same as before */
+    	    }
+
+    	    idle_ticks++;
+    	    if (idle_ticks > 300000) {   /* roughly ~1s — tune by testing */
+    	        idle_ticks = 0;          /* triggers re-announce next pass */
+    	    }
+    	}
+
+    	GPIOA->ODR ^= (1u << 6);    /* LED toggles = SYNC received */
 
     	    /* 2. Read header */
     	    uint8_t cmd  = uart_recv();
